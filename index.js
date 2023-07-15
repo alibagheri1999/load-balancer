@@ -1,13 +1,53 @@
-const http = require("http");
-const httpProxy = require("http-proxy-middleware");
+const express = require("express");
+const { createProxyMiddleware } = require("http-proxy-middleware");
 const os = require("os");
+const osUtils = require('os-utils');
 const axios = require("axios");
+const prometheus = require("prom-client");
 
+// Create a counter metric
+const requestsCounter = new prometheus.Counter({
+  name: "app_requests_total",
+  help: "Total number of requests",
+  labelNames: ["host", "name", "object"],
+});
+
+const cpuUsageGauge = new prometheus.Gauge({
+  name: "node_cpu_usage",
+  help: "Current CPU usage of the Node.js application",
+  labelNames: ["host", "name", "object"],
+});
+
+// Create a gauge metric for memory usage
+const memoryUsageGauge = new prometheus.Gauge({
+  name: "node_memory_usage",
+  help: "Current memory usage of the Node.js application",
+  labelNames: ["host", "name", "object"],
+});
+
+const getCpuUsagePercentage = () => {
+  return new Promise((resolve) => {
+    osUtils.cpuUsage((cpuPercentage) => {
+      resolve(cpuPercentage * 100);
+    });
+  });
+};
+
+// Update the metrics periodically
+setInterval(async() => {
+  const cpuUsage = Number((await getCpuUsagePercentage()).toFixed(2));
+  const memoryUsage = process.memoryUsage().rss;
+  console.log(cpuUsage, memoryUsage);
+  cpuUsageGauge.set({ host: "111", name: "111", object: "111" }, cpuUsage);
+  memoryUsageGauge.set(
+    { host: "111", name: "111", object: "111" },
+    memoryUsage
+  );
+}, 1000);
 const servers = [
-  { target: "http://46.102.140.42:3031", weight: 1 },
-  { target: "http://localhost:3031", weight: 2 },
-  { target: "http://localhost:3032", weight: 3 },
-  { target: "http://localhost:3033", weight: 4 },
+  { target: "http://localhost:3031", weight: 1 },
+  { target: "http://localhost:3032", weight: 2 },
+  { target: "http://localhost:3033", weight: 3 },
 ];
 
 let currentServer = null;
@@ -26,12 +66,7 @@ function selectServer() {
   });
 }
 
-const loadBalancer = http.createServer((req, res) => {
-  if (!currentServer) {
-    currentServer = selectServer();
-  }
-  currentServer.proxy(req, res);
-});
+const app = express();
 
 function monitorServerResources() {
   servers.forEach(async (server) => {
@@ -72,18 +107,41 @@ function monitorServerResources() {
     };
   });
 }
-setTimeout(monitorServerResources, 5000); 
+setTimeout(monitorServerResources, 5000);
 
 monitorServerResources();
 
+app.use(async (req, res, next) => {
+  if (req.originalUrl === "/metrics") {
+    next();
+  } else {
+    requestsCounter.inc({
+      host: "111",
+      name: "111",
+      object: "111",
+    });
+    next();
+  }
+});
 servers.forEach((server) => {
-  server.proxy = httpProxy.createProxyMiddleware({
+  server.proxy = createProxyMiddleware({
     target: server.target,
     changeOrigin: true,
+    router: () => {
+      currentServer = selectServer();
+      return currentServer.target;
+    },
   });
+
+  app.use("/api", server.proxy);
+});
+
+app.use("/metrics", async (req, res) => {
+  res.set("Content-Type", prometheus.register.contentType);
+  res.end(await prometheus.register.metrics());
 });
 
 const PORT = 8080;
-loadBalancer.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log(`Load balancer running on port ${PORT}`);
 });
